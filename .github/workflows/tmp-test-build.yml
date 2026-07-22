@@ -1,0 +1,18 @@
+name: Test build tmp
+on:
+    workflow_dispatch:
+
+jobs:
+    build-e2e-image:
+        name: Build & Push E2E Test Image
+        permissions:
+            contents: read
+            packages: write
+        uses: onecx/ci-common/.github/workflows/docker-build.yml@v1
+        secrets: inherit
+        with:
+            tags: "{{ .Version }}-e2e,{{ .Branch }}-e2e"
+            push: true
+            samoDockerFile: integration-tests/e2e-tests/playwright/workspace.Dockerfile
+            samoDockerContext: integration-tests/e2e-tests/playwright
+            artifact: ""
