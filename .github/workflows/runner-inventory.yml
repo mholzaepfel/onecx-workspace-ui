@@ -1,0 +1,694 @@
+name: Runner Inventory
+
+"on":
+    workflow_dispatch:
+        inputs:
+            run_benchmark:
+                description: Run optional benchmark suite
+                type: boolean
+                required: false
+                default: false
+            include_large_file_listing:
+                description: Run optional large-file analysis
+                type: boolean
+                required: false
+                default: false
+
+permissions: {}
+
+jobs:
+    inventory:
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        env:
+            REPORT_DIR: runner-report
+            ARCHIVE_NAME: ubuntu-runner-report.tar.gz
+            REPORT_VERSION: "3"
+            RUN_BENCHMARK: ${{ inputs.run_benchmark }}
+            INCLUDE_LARGE: ${{ inputs.include_large_file_listing }}
+        steps:
+            - name: Collect inventory
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+
+                  mkdir -p "$REPORT_DIR"
+
+                  SYSTEM_FILE="$REPORT_DIR/system.txt"
+                  CPU_FILE="$REPORT_DIR/cpu.txt"
+                  MEMORY_FILE="$REPORT_DIR/memory.txt"
+                  STORAGE_FILE="$REPORT_DIR/storage.txt"
+                  FS_FILE="$REPORT_DIR/filesystems.txt"
+                  LIMITS_FILE="$REPORT_DIR/limits.txt"
+                  PACKAGES_FILE="$REPORT_DIR/packages.txt"
+                  TOOLS_FILE="$REPORT_DIR/tools.txt"
+                  LANG_FILE="$REPORT_DIR/languages.txt"
+                  DOCKER_FILE="$REPORT_DIR/docker.txt"
+                  DOCKER_JSON_FILE="$REPORT_DIR/docker-info.json"
+                  LARGE_FILES_FILE="$REPORT_DIR/large-files.txt"
+                  LARGE_DIRS_FILE="$REPORT_DIR/large-directories.txt"
+                  BENCH_FILE="$REPORT_DIR/benchmark.txt"
+
+                  : > "$SYSTEM_FILE"
+                  : > "$CPU_FILE"
+                  : > "$MEMORY_FILE"
+                  : > "$STORAGE_FILE"
+                  : > "$FS_FILE"
+                  : > "$LIMITS_FILE"
+                  : > "$PACKAGES_FILE"
+                  : > "$TOOLS_FILE"
+                  : > "$LANG_FILE"
+                  : > "$DOCKER_FILE"
+
+                  if [[ "$INCLUDE_LARGE" == "false" ]]; then
+                    printf '%s\n' 'Large-file analysis not requested.' > "$LARGE_FILES_FILE"
+                    printf '%s\n' 'Large-file analysis not requested.' > "$LARGE_DIRS_FILE"
+                  fi
+
+                  if [[ "$RUN_BENCHMARK" == "false" ]]; then
+                    printf '%s\n' 'Benchmark not requested.' > "$BENCH_FILE"
+                  fi
+
+                  run_capture() {
+                    local output_file="$1"
+                    local label="$2"
+                    shift 2
+                    {
+                      printf '===== %s =====\n' "$label"
+                      printf '$'
+                      printf ' %q' "$@"
+                      printf '\n'
+                      local rc=0
+                      if "$@"; then
+                        rc=0
+                      else
+                        rc=$?
+                      fi
+                      printf '[exit=%s]\n\n' "$rc"
+                    } >>"$output_file" 2>&1
+                    return 0
+                  }
+
+                  report_tool() {
+                    local out_file="$1"
+                    local name="$2"
+                    local cmd="$3"
+                    local version_cmd="$4"
+                    local path="not found"
+                    local version="not found"
+
+                    if command -v "$cmd" > /dev/null 2>&1; then
+                      path="$(command -v "$cmd")"
+                      version="$(bash -lc "$version_cmd" 2>&1 | head -n1 || true)"
+                      if [[ -z "$version" ]]; then
+                        version="version unavailable"
+                      fi
+                    fi
+
+                    {
+                      printf '%s\n' "name=$name"
+                      printf '%s\n' "path=$path"
+                      printf '%s\n\n' "version=$version"
+                    } >> "$out_file"
+                  }
+
+                  read_cgroup_value() {
+                    local target_file="$1"
+                    if [[ -r "$target_file" ]]; then
+                      cat "$target_file"
+                    else
+                      printf '%s' 'unavailable'
+                    fi
+                  }
+
+                  # system.txt
+                  run_capture "$SYSTEM_FILE" "uname -a" uname -a
+                  run_capture "$SYSTEM_FILE" "uname -r" uname -r
+                  run_capture "$SYSTEM_FILE" "os-release" cat /etc/os-release
+                  run_capture "$SYSTEM_FILE" "lsb_release -a" lsb_release -a
+                  run_capture "$SYSTEM_FILE" "hostnamectl" hostnamectl
+                  run_capture "$SYSTEM_FILE" "id" id
+                  run_capture "$SYSTEM_FILE" "date -u" date -u
+                  run_capture "$SYSTEM_FILE" "uptime" uptime
+                  run_capture "$SYSTEM_FILE" "systemd-detect-virt" systemd-detect-virt
+                  run_capture "$SYSTEM_FILE" "arch" arch
+                  {
+                    printf 'runner_image_name=%s\n' "${ImageOS:-unknown}"
+                    printf 'runner_image_version=%s\n' "${ImageVersion:-unknown}"
+                    printf 'runner_image_label=%s\n\n' "${ImageLabel:-unknown}"
+                  } >> "$SYSTEM_FILE"
+
+                  # cpu.txt
+                  run_capture "$CPU_FILE" "lscpu" lscpu
+                  run_capture "$CPU_FILE" "nproc" nproc
+                  run_capture "$CPU_FILE" "cpuinfo" cat /proc/cpuinfo
+
+                  # memory.txt
+                  run_capture "$MEMORY_FILE" "free -h" free -h
+                  run_capture "$MEMORY_FILE" "free -b" free -b
+                  run_capture "$MEMORY_FILE" "meminfo" cat /proc/meminfo
+                  run_capture "$MEMORY_FILE" "vmstat" vmstat
+                  run_capture "$MEMORY_FILE" "swapon --show" swapon --show
+                  run_capture "$MEMORY_FILE" "/dev/shm capacity" df -h /dev/shm
+
+                  # storage.txt and filesystems.txt
+                  run_capture "$STORAGE_FILE" "df -hT" df -hT
+                  run_capture "$STORAGE_FILE" "df -B1" df -B1
+                  run_capture "$STORAGE_FILE" "df -i" df -i
+                  run_capture "$STORAGE_FILE" "lsblk" lsblk
+                  run_capture "$FS_FILE" "findmnt" findmnt
+                  run_capture "$FS_FILE" "proc mounts" cat /proc/mounts
+                  run_capture "$STORAGE_FILE" "du -sb /opt" du -sb /opt
+                  run_capture "$STORAGE_FILE" "du -sb /usr/local" du -sb /usr/local
+                  run_capture "$STORAGE_FILE" "du -sb /opt/hostedtoolcache" du -sb /opt/hostedtoolcache
+                  run_capture "$STORAGE_FILE" "du -sb RUNNER_TEMP" du -sb "${RUNNER_TEMP:-/tmp}"
+
+                  # limits.txt
+                  run_capture "$LIMITS_FILE" "ulimit -a" bash -lc 'ulimit -a'
+                  run_capture "$LIMITS_FILE" "proc self limits" cat /proc/self/limits
+                  run_capture "$LIMITS_FILE" "current process count" bash -lc 'ps -e --no-headers | wc -l'
+                  run_capture "$LIMITS_FILE" "open-file limit" bash -lc 'ulimit -n'
+                  run_capture "$LIMITS_FILE" "user-process limit" bash -lc 'ulimit -u'
+                  run_capture "$LIMITS_FILE" "inotify max_user_instances" cat /proc/sys/fs/inotify/max_user_instances
+                  run_capture "$LIMITS_FILE" "inotify max_user_watches" cat /proc/sys/fs/inotify/max_user_watches
+                  run_capture "$LIMITS_FILE" "inotify max_queued_events" cat /proc/sys/fs/inotify/max_queued_events
+                  run_capture "$LIMITS_FILE" "ephemeral port range" cat /proc/sys/net/ipv4/ip_local_port_range
+                  run_capture "$LIMITS_FILE" "/dev/shm capacity" df -h /dev/shm
+
+                  if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
+                    CGROUP_MODE="v2"
+                  else
+                    CGROUP_MODE="v1"
+                  fi
+
+                  CGROUP_CPU_LIMIT="unavailable"
+                  CGROUP_MEM_LIMIT="unavailable"
+                  CGROUP_PIDS_LIMIT="unavailable"
+
+                  if [[ "$CGROUP_MODE" == "v2" ]]; then
+                    CGROUP_CPU_LIMIT="$(read_cgroup_value /sys/fs/cgroup/cpu.max)"
+                    CGROUP_MEM_LIMIT="$(read_cgroup_value /sys/fs/cgroup/memory.max)"
+                    CGROUP_PIDS_LIMIT="$(read_cgroup_value /sys/fs/cgroup/pids.max)"
+                  else
+                    quota="$(read_cgroup_value /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"
+                    period="$(read_cgroup_value /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
+                    CGROUP_CPU_LIMIT="quota=${quota} period=${period}"
+                    CGROUP_MEM_LIMIT="$(read_cgroup_value /sys/fs/cgroup/memory/memory.limit_in_bytes)"
+                    CGROUP_PIDS_LIMIT="$(read_cgroup_value /sys/fs/cgroup/pids/pids.max)"
+                  fi
+
+                  {
+                    printf 'cgroup_version=%s\n' "$CGROUP_MODE"
+                    printf 'cgroup_cpu_limit=%s\n' "$CGROUP_CPU_LIMIT"
+                    printf 'cgroup_memory_limit=%s\n' "$CGROUP_MEM_LIMIT"
+                    printf 'cgroup_pids_limit=%s\n\n' "$CGROUP_PIDS_LIMIT"
+                  } >> "$LIMITS_FILE"
+
+                  # packages.txt
+                  run_capture "$PACKAGES_FILE" "dpkg-query -W" bash -lc "dpkg-query -W -f='\${Package}\t\${Version}\n' | LC_ALL=C sort"
+
+                  # tools.txt
+                  report_tool "$TOOLS_FILE" "bash" "bash" "bash --version"
+                  report_tool "$TOOLS_FILE" "git" "git" "git --version"
+                  report_tool "$TOOLS_FILE" "git-lfs" "git-lfs" "git-lfs version"
+                  report_tool "$TOOLS_FILE" "gh" "gh" "gh --version"
+                  report_tool "$TOOLS_FILE" "curl" "curl" "curl --version"
+                  report_tool "$TOOLS_FILE" "wget" "wget" "wget --version"
+                  report_tool "$TOOLS_FILE" "jq" "jq" "jq --version"
+                  report_tool "$TOOLS_FILE" "yq" "yq" "yq --version"
+                  report_tool "$TOOLS_FILE" "tar" "tar" "tar --version"
+                  report_tool "$TOOLS_FILE" "zip" "zip" "zip --version"
+                  report_tool "$TOOLS_FILE" "unzip" "unzip" "unzip -v"
+                  report_tool "$TOOLS_FILE" "gzip" "gzip" "gzip --version"
+                  report_tool "$TOOLS_FILE" "xz" "xz" "xz --version"
+                  report_tool "$TOOLS_FILE" "zstd" "zstd" "zstd --version"
+                  report_tool "$TOOLS_FILE" "make" "make" "make --version"
+                  report_tool "$TOOLS_FILE" "cmake" "cmake" "cmake --version"
+                  report_tool "$TOOLS_FILE" "ninja" "ninja" "ninja --version"
+                  report_tool "$TOOLS_FILE" "docker" "docker" "docker --version"
+                  report_tool "$TOOLS_FILE" "kubectl" "kubectl" "kubectl version --client --short"
+                  report_tool "$TOOLS_FILE" "helm" "helm" "helm version"
+                  report_tool "$TOOLS_FILE" "terraform" "terraform" "terraform version"
+                  report_tool "$TOOLS_FILE" "packer" "packer" "packer version"
+                  report_tool "$TOOLS_FILE" "ansible" "ansible" "ansible --version"
+                  report_tool "$TOOLS_FILE" "az" "az" "az version"
+                  report_tool "$TOOLS_FILE" "aws" "aws" "aws --version"
+                  report_tool "$TOOLS_FILE" "gcloud" "gcloud" "gcloud --version"
+
+                  {
+                    if command -v docker > /dev/null 2>&1; then
+                      printf '%s\n' 'name=docker compose'
+                      printf '%s\n' "path=$(command -v docker)"
+                      printf '%s\n\n' "version=$(docker compose version 2>&1 | head -n1 || echo version unavailable)"
+                      printf '%s\n' 'name=docker buildx'
+                      printf '%s\n' "path=$(command -v docker)"
+                      printf '%s\n\n' "version=$(docker buildx version 2>&1 | head -n1 || echo version unavailable)"
+                    else
+                      printf '%s\n' 'name=docker compose'
+                      printf '%s\n' 'path=not found'
+                      printf '%s\n\n' 'version=not found'
+                      printf '%s\n' 'name=docker buildx'
+                      printf '%s\n' 'path=not found'
+                      printf '%s\n\n' 'version=not found'
+                    fi
+                  } >> "$TOOLS_FILE"
+
+                  # languages.txt
+                  report_tool "$LANG_FILE" "gcc" "gcc" "gcc --version"
+                  report_tool "$LANG_FILE" "g++" "g++" "g++ --version"
+                  report_tool "$LANG_FILE" "clang" "clang" "clang --version"
+                  report_tool "$LANG_FILE" "clang++" "clang++" "clang++ --version"
+                  report_tool "$LANG_FILE" "node" "node" "node --version"
+                  report_tool "$LANG_FILE" "npm" "npm" "npm --version"
+                  report_tool "$LANG_FILE" "yarn" "yarn" "yarn --version"
+                  report_tool "$LANG_FILE" "pnpm" "pnpm" "pnpm --version"
+                  report_tool "$LANG_FILE" "python3" "python3" "python3 --version"
+                  report_tool "$LANG_FILE" "pip" "pip" "pip --version"
+                  report_tool "$LANG_FILE" "pip3" "pip3" "pip3 --version"
+                  report_tool "$LANG_FILE" "pipx" "pipx" "pipx --version"
+                  report_tool "$LANG_FILE" "java" "java" "java -version"
+                  report_tool "$LANG_FILE" "javac" "javac" "javac -version"
+                  report_tool "$LANG_FILE" "mvn" "mvn" "mvn -version"
+                  report_tool "$LANG_FILE" "gradle" "gradle" "gradle --version"
+                  report_tool "$LANG_FILE" "dotnet" "dotnet" "dotnet --info"
+                  report_tool "$LANG_FILE" "mono" "mono" "mono --version"
+                  report_tool "$LANG_FILE" "go" "go" "go version"
+                  report_tool "$LANG_FILE" "rustc" "rustc" "rustc --version"
+                  report_tool "$LANG_FILE" "cargo" "cargo" "cargo --version"
+                  report_tool "$LANG_FILE" "ruby" "ruby" "ruby --version"
+                  report_tool "$LANG_FILE" "gem" "gem" "gem --version"
+                  report_tool "$LANG_FILE" "php" "php" "php --version"
+                  report_tool "$LANG_FILE" "composer" "composer" "composer --version"
+                  report_tool "$LANG_FILE" "pwsh" "pwsh" "pwsh --version"
+
+                  # docker.txt and docker-info.json
+                  DOCKER_TEST_NET="ri-net-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}"
+                  DOCKER_TEST_CONT="ri-cont-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}"
+                  DOCKER_NET_CONT="ri-netcont-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}"
+                  DOCKER_MOUNT_CONT="ri-mount-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}"
+                  DOCKER_BIND_DIR="${RUNNER_TEMP:-/tmp}/ri-bind-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}"
+                  DOCKER_BIND_FILE="$DOCKER_BIND_DIR/test.txt"
+
+                  docker_cleanup() {
+                    docker rm -f "$DOCKER_TEST_CONT" > /dev/null 2>&1 || true
+                    docker rm -f "$DOCKER_NET_CONT" > /dev/null 2>&1 || true
+                    docker rm -f "$DOCKER_MOUNT_CONT" > /dev/null 2>&1 || true
+                    docker network rm "$DOCKER_TEST_NET" > /dev/null 2>&1 || true
+                    rm -rf "$DOCKER_BIND_DIR" || true
+                  }
+                  trap docker_cleanup EXIT
+
+                  if command -v docker > /dev/null 2>&1; then
+                    run_capture "$DOCKER_FILE" "docker version" docker version
+                    run_capture "$DOCKER_FILE" "docker info" docker info
+                    run_capture "$DOCKER_FILE" "docker compose version" docker compose version
+                    run_capture "$DOCKER_FILE" "docker buildx version" docker buildx version
+                    run_capture "$DOCKER_FILE" "docker system df" docker system df
+                    run_capture "$DOCKER_FILE" "docker image ls" docker image ls
+                    run_capture "$DOCKER_FILE" "docker container ls -a" docker container ls -a
+                    run_capture "$DOCKER_FILE" "docker network ls" docker network ls
+                    run_capture "$DOCKER_FILE" "docker volume ls" docker volume ls
+
+                    run_capture "$STORAGE_FILE" "docker disk usage" docker system df
+
+                    if timeout 45s docker pull alpine:3.20 >> "$DOCKER_FILE" 2>&1; then
+                      printf '%s\n' '[docker_pull_alpine exit=0]' >> "$DOCKER_FILE"
+                    else
+                      printf '%s\n' "[docker_pull_alpine exit=$?]" >> "$DOCKER_FILE"
+                    fi
+
+                    if timeout 30s docker run --rm --pull=never --name "$DOCKER_TEST_CONT" alpine:3.20 sh -c 'echo ok' >> "$DOCKER_FILE" 2>&1; then
+                      printf '%s\n' '[docker_startup_test exit=0]' >> "$DOCKER_FILE"
+                    else
+                      printf '%s\n' "[docker_startup_test exit=$?]" >> "$DOCKER_FILE"
+                    fi
+
+                    mkdir -p "$DOCKER_BIND_DIR"
+                    printf '%s\n' 'runner bind mount test file' > "$DOCKER_BIND_FILE"
+                    if timeout 30s docker run --rm --pull=never --name "$DOCKER_MOUNT_CONT" -v "$DOCKER_BIND_DIR:/mnt/ri:ro" alpine:3.20 sh -c 'test -f /mnt/ri/test.txt && cat /mnt/ri/test.txt' >> "$DOCKER_FILE" 2>&1; then
+                      printf '%s\n' '[docker_bind_mount_test exit=0]' >> "$DOCKER_FILE"
+                    else
+                      printf '%s\n' "[docker_bind_mount_test exit=$?]" >> "$DOCKER_FILE"
+                    fi
+
+                    run_capture "$DOCKER_FILE" "docker network create" docker network create "$DOCKER_TEST_NET"
+
+                    network_test_rc=0
+                    if timeout 30s docker run \
+                      --rm \
+                      --pull=never \
+                      --name "$DOCKER_NET_CONT" \
+                      --network "$DOCKER_TEST_NET" \
+                      alpine:3.20 \
+                      sh -c 'wget -qSO- --spider https://api.github.com' \
+                      >>"$DOCKER_FILE" 2>&1; then
+                      network_test_rc=0
+                    else
+                      network_test_rc=$?
+                    fi
+
+                    printf '[docker_network_https_test exit=%s]\n' \
+                      "$network_test_rc" \
+                      >>"$DOCKER_FILE"
+
+                    if docker info --format '{{json .}}' > "$DOCKER_JSON_FILE" 2> /dev/null; then
+                      if command -v jq > /dev/null 2>&1; then
+                        jq . "$DOCKER_JSON_FILE" > "$DOCKER_JSON_FILE.tmp" && mv "$DOCKER_JSON_FILE.tmp" "$DOCKER_JSON_FILE"
+                        jq -e . "$DOCKER_JSON_FILE" > /dev/null
+                      fi
+                    else
+                      printf '%s\n' '{"available": false}' > "$DOCKER_JSON_FILE"
+                    fi
+                  else
+                    printf '%s\n' 'docker: not found' >> "$DOCKER_FILE"
+                    printf '%s\n' '{"available": false}' > "$DOCKER_JSON_FILE"
+                  fi
+
+                  # metadata json with boolean options
+                  if command -v jq > /dev/null 2>&1; then
+                    jq -n \
+                      --arg report_version "$REPORT_VERSION" \
+                      --arg generated_at_utc "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+                      --arg runner_os "${RUNNER_OS:-}" \
+                      --arg runner_arch "${RUNNER_ARCH:-}" \
+                      --arg image_os "${ImageOS:-}" \
+                      --arg image_version "${ImageVersion:-}" \
+                      --arg image_label "${ImageLabel:-}" \
+                      --arg github_run_id "${GITHUB_RUN_ID:-}" \
+                      --arg github_run_attempt "${GITHUB_RUN_ATTEMPT:-}" \
+                      --argjson run_benchmark "$RUN_BENCHMARK" \
+                      --argjson include_large_file_listing "$INCLUDE_LARGE" \
+                      '{
+                        report_version: $report_version,
+                        generated_at_utc: $generated_at_utc,
+                        runner_os: $runner_os,
+                        runner_arch: $runner_arch,
+                        image_os: $image_os,
+                        image_version: $image_version,
+                        image_label: $image_label,
+                        github_run_id: $github_run_id,
+                        github_run_attempt: $github_run_attempt,
+                        options: {
+                          run_benchmark: $run_benchmark,
+                          include_large_file_listing: $include_large_file_listing
+                        }
+                      }' > "$REPORT_DIR/report-metadata.json"
+                    jq -e . "$REPORT_DIR/report-metadata.json" > /dev/null
+                  else
+                    python3 -c "import json,os,datetime; d={'report_version':os.environ.get('REPORT_VERSION',''),'generated_at_utc':datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),'runner_os':os.environ.get('RUNNER_OS',''),'runner_arch':os.environ.get('RUNNER_ARCH',''),'image_os':os.environ.get('ImageOS',''),'image_version':os.environ.get('ImageVersion',''),'image_label':os.environ.get('ImageLabel',''),'github_run_id':os.environ.get('GITHUB_RUN_ID',''),'github_run_attempt':os.environ.get('GITHUB_RUN_ATTEMPT',''),'options':{'run_benchmark':str(os.environ.get('RUN_BENCHMARK','false')).lower()=='true','include_large_file_listing':str(os.environ.get('INCLUDE_LARGE','false')).lower()=='true'}}; open(os.path.join(os.environ.get('REPORT_DIR','runner-report'),'report-metadata.json'),'w',encoding='utf-8').write(json.dumps(d,indent=2)+'\\n')"
+                  fi
+
+                  # summary
+                  OS_NAME="$(awk -F= '/^PRETTY_NAME=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2> /dev/null || true)"
+                  if [[ -z "$OS_NAME" ]]; then OS_NAME="unknown"; fi
+
+                  CPU_MODEL="$(awk -F: '/model name/ {gsub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2> /dev/null || true)"
+                  if [[ -z "$CPU_MODEL" ]]; then CPU_MODEL="unknown"; fi
+
+                  CPU_COUNT="$(nproc 2> /dev/null || echo unknown)"
+                  MEM_BYTES="$(awk '/MemTotal/ {print $2*1024}' /proc/meminfo 2> /dev/null || echo 0)"
+                  ROOT_TOTAL_B="$(df --output=size -B1 / 2> /dev/null | tail -n1 | tr -d ' ' || true)"
+                  ROOT_FREE_B="$(df --output=avail -B1 / 2> /dev/null | tail -n1 | tr -d ' ' || true)"
+                  SHM_CAP="$(df -h /dev/shm 2> /dev/null | awk 'NR==2{print $2}' || true)"
+
+                  if command -v numfmt > /dev/null 2>&1; then
+                    MEM_H="$(numfmt --to=iec --suffix=B "${MEM_BYTES:-0}" 2> /dev/null || echo unknown)"
+                    ROOT_TOTAL_H="$(numfmt --to=iec --suffix=B "${ROOT_TOTAL_B:-0}" 2> /dev/null || echo unknown)"
+                    ROOT_FREE_H="$(numfmt --to=iec --suffix=B "${ROOT_FREE_B:-0}" 2> /dev/null || echo unknown)"
+                  else
+                    MEM_H="${MEM_BYTES:-unknown}"
+                    ROOT_TOTAL_H="${ROOT_TOTAL_B:-unknown}"
+                    ROOT_FREE_H="${ROOT_FREE_B:-unknown}"
+                  fi
+
+                  DOCKER_VER="not found"
+                  if command -v docker > /dev/null 2>&1; then
+                    DOCKER_VER="$(docker --version 2> /dev/null || echo available)"
+                  fi
+
+                  {
+                    echo "# Runner Inventory Summary"
+                    echo
+                    echo "- Ubuntu release: ${OS_NAME}"
+                    echo "- Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown} (${ImageLabel:-unknown})"
+                    echo "- CPU model: ${CPU_MODEL}"
+                    echo "- Logical CPU count: ${CPU_COUNT}"
+                    echo "- Total memory: ${MEM_H}"
+                    echo "- Root filesystem capacity: ${ROOT_TOTAL_H}"
+                    echo "- Free root filesystem space: ${ROOT_FREE_H}"
+                    echo "- cgroup CPU limit: ${CGROUP_CPU_LIMIT}"
+                    echo "- cgroup memory limit: ${CGROUP_MEM_LIMIT}"
+                    echo "- cgroup PID limit: ${CGROUP_PIDS_LIMIT}"
+                    echo "- /dev/shm capacity: ${SHM_CAP:-unknown}"
+                    echo "- Docker availability/version: ${DOCKER_VER}"
+                    echo "- Node: $(node --version 2> /dev/null || echo not found)"
+                    echo "- Python: $(python3 --version 2> /dev/null || echo not found)"
+                    echo "- Java: $(java -version 2>&1 | head -n1 || echo not found)"
+                    echo "- .NET: $(dotnet --version 2> /dev/null || echo not found)"
+                    echo "- Benchmark enabled: ${RUN_BENCHMARK}"
+                    echo "- Large-file analysis enabled: ${INCLUDE_LARGE}"
+                    echo
+                    echo "## Generated files"
+                    echo "- summary.md"
+                    echo "- system.txt"
+                    echo "- cpu.txt"
+                    echo "- memory.txt"
+                    echo "- storage.txt"
+                    echo "- filesystems.txt"
+                    echo "- limits.txt"
+                    echo "- packages.txt"
+                    echo "- tools.txt"
+                    echo "- languages.txt"
+                    echo "- docker.txt"
+                    echo "- docker-info.json"
+                    echo "- large-files.txt"
+                    echo "- large-directories.txt"
+                    echo "- benchmark.txt"
+                    echo "- report-metadata.json"
+                    echo "- checksums.sha256"
+                  } > "$REPORT_DIR/summary.md"
+
+            - name: Optional large-file analysis
+              if: ${{ inputs.include_large_file_listing }}
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+
+                  mkdir -p "$REPORT_DIR"
+                  LARGE_FILES_FILE="$REPORT_DIR/large-files.txt"
+                  LARGE_DIRS_FILE="$REPORT_DIR/large-directories.txt"
+
+                  : > "$LARGE_FILES_FILE"
+                  : > "$LARGE_DIRS_FILE"
+
+                  find /opt -xdev -type f -printf '%s\t%p\n' 2> /dev/null > "$RUNNER_TEMP/ri_large_files_1.txt" || true
+                  find /usr/local -xdev -type f -printf '%s\t%p\n' 2> /dev/null > "$RUNNER_TEMP/ri_large_files_2.txt" || true
+                  find /opt/hostedtoolcache -xdev -type f -printf '%s\t%p\n' 2> /dev/null > "$RUNNER_TEMP/ri_large_files_3.txt" || true
+
+                  cat "$RUNNER_TEMP/ri_large_files_1.txt" "$RUNNER_TEMP/ri_large_files_2.txt" "$RUNNER_TEMP/ri_large_files_3.txt" \
+                    | sort -nr -k1,1 | head -n 200 > "$LARGE_FILES_FILE" || true
+
+                  du -x -B1 -d 3 /opt /usr/local /opt/hostedtoolcache 2> /dev/null \
+                    | sort -nr -k1,1 | head -n 200 > "$LARGE_DIRS_FILE" || true
+
+                  rm -f "$RUNNER_TEMP/ri_large_files_1.txt" "$RUNNER_TEMP/ri_large_files_2.txt" "$RUNNER_TEMP/ri_large_files_3.txt" || true
+
+            - name: Optional benchmark
+              if: ${{ inputs.run_benchmark }}
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+
+                  mkdir -p "$REPORT_DIR"
+                  BENCH_FILE="$REPORT_DIR/benchmark.txt"
+                  TMP_DIR="$RUNNER_TEMP/ri-bench-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}"
+                  BENCH_DISK_FILE="$TMP_DIR/bench-disk.bin"
+                  CPU_SCRIPT="$TMP_DIR/cpu_bench.py"
+                  BENCH_CONT="ri-bench-cont-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}"
+
+                  mkdir -p "$TMP_DIR"
+                  : > "$BENCH_FILE"
+
+                  cleanup_bench() {
+                    rm -f "$BENCH_DISK_FILE" "$CPU_SCRIPT" || true
+                    docker rm -f "$BENCH_CONT" > /dev/null 2>&1 || true
+                    rm -rf "$TMP_DIR" || true
+                  }
+                  trap cleanup_bench EXIT
+
+                  {
+                    echo "# Runner Benchmark"
+                    echo "started_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+                  } >> "$BENCH_FILE"
+
+                  printf '%s\n' \
+                    'import math' \
+                    'import time' \
+                    '' \
+                    'start = time.time()' \
+                    'count = 0' \
+                    'limit = 150000' \
+                    'for n in range(2, limit):' \
+                    '    prime = True' \
+                    '    root = int(math.sqrt(n))' \
+                    '    for d in range(2, root + 1):' \
+                    '        if n % d == 0:' \
+                    '            prime = False' \
+                    '            break' \
+                    '    if prime:' \
+                    '        count += 1' \
+                    'elapsed = time.time() - start' \
+                    'print(f"limit={limit}")' \
+                    'print(f"primes_found={count}")' \
+                    'print(f"elapsed_seconds={elapsed:.3f}")' \
+                    > "$CPU_SCRIPT"
+
+                  rc=0
+                  if timeout 45s python3 "$CPU_SCRIPT" >> "$BENCH_FILE" 2>&1; then
+                    rc=0
+                  else
+                    rc=$?
+                  fi
+                  printf 'cpu_benchmark_exit=%s\n\n' "$rc" >> "$BENCH_FILE"
+
+                  set +e
+                  timeout 35s dd if=/dev/zero of="$BENCH_DISK_FILE" bs=1M count=512 conv=fdatasync 2>&1 | tee -a "$BENCH_FILE"
+                  rc=${PIPESTATUS[0]}
+                  set -e
+                  printf 'disk_write_exit=%s\n\n' "$rc" >> "$BENCH_FILE"
+
+                  set +e
+                  timeout 25s dd if="$BENCH_DISK_FILE" of=/dev/null bs=4M 2>&1 | tee -a "$BENCH_FILE"
+                  rc=${PIPESTATUS[0]}
+                  set -e
+                  printf 'disk_read_exit=%s\n\n' "$rc" >> "$BENCH_FILE"
+
+                  if command -v docker > /dev/null 2>&1; then
+                    start_epoch=$(date +%s)
+                    rc=0
+                    if timeout 30s docker run --rm --pull=never --name "$BENCH_CONT" alpine:3.20 sh -c 'echo benchmark-container-ok' >> "$BENCH_FILE" 2>&1; then
+                      rc=0
+                    else
+                      rc=$?
+                    fi
+                    end_epoch=$(date +%s)
+                    printf 'docker_startup_exit=%s\n' "$rc" >> "$BENCH_FILE"
+                    printf 'docker_startup_duration_seconds=%s\n\n' "$((end_epoch - start_epoch))" >> "$BENCH_FILE"
+                  else
+                    printf '%s\n\n' 'docker: not found' >> "$BENCH_FILE"
+                  fi
+
+                  printf 'finished_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$BENCH_FILE"
+
+            - name: Cleanup optional leftovers
+              if: always()
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+
+                  docker rm -f "ri-bench-cont-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}" > /dev/null 2>&1 || true
+                  docker rm -f "ri-cont-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}" > /dev/null 2>&1 || true
+                  docker rm -f "ri-netcont-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}" > /dev/null 2>&1 || true
+                  docker rm -f "ri-mount-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}" > /dev/null 2>&1 || true
+                  docker network rm "ri-net-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}" > /dev/null 2>&1 || true
+                  rm -rf "${RUNNER_TEMP:-/tmp}/ri-bind-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}" || true
+                  rm -rf "$RUNNER_TEMP"/ri-bench-* || true
+                  rm -f "$RUNNER_TEMP"/ri_large_files_1.txt "$RUNNER_TEMP"/ri_large_files_2.txt "$RUNNER_TEMP"/ri_large_files_3.txt || true
+
+            - name: Finalize report
+              if: always()
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+
+                  mkdir -p "$REPORT_DIR"
+
+                  if [[ ! -f "$REPORT_DIR/summary.md" ]]; then
+                    {
+                      echo "# Runner Inventory Summary"
+                      echo
+                      echo "Inventory collection did not complete successfully."
+                      echo "Fallback summary generated in finalization step."
+                    } > "$REPORT_DIR/summary.md"
+                  fi
+
+                  if [[ ! -f "$REPORT_DIR/report-metadata.json" ]]; then
+                    if command -v jq > /dev/null 2>&1; then
+                      jq -n \
+                        --arg report_version "$REPORT_VERSION" \
+                        --arg generated_at_utc "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+                        --arg runner_os "${RUNNER_OS:-}" \
+                        --arg runner_arch "${RUNNER_ARCH:-}" \
+                        --arg image_os "${ImageOS:-}" \
+                        --arg image_version "${ImageVersion:-}" \
+                        --arg image_label "${ImageLabel:-}" \
+                        --arg github_run_id "${GITHUB_RUN_ID:-}" \
+                        --arg github_run_attempt "${GITHUB_RUN_ATTEMPT:-}" \
+                        --argjson run_benchmark "$RUN_BENCHMARK" \
+                        --argjson include_large_file_listing "$INCLUDE_LARGE" \
+                        '{
+                          report_version: $report_version,
+                          generated_at_utc: $generated_at_utc,
+                          runner_os: $runner_os,
+                          runner_arch: $runner_arch,
+                          image_os: $image_os,
+                          image_version: $image_version,
+                          image_label: $image_label,
+                          github_run_id: $github_run_id,
+                          github_run_attempt: $github_run_attempt,
+                          options: {
+                            run_benchmark: $run_benchmark,
+                            include_large_file_listing: $include_large_file_listing
+                          }
+                        }' > "$REPORT_DIR/report-metadata.json"
+                    else
+                      python3 -c "import json,os,datetime; d={'report_version':os.environ.get('REPORT_VERSION',''),'generated_at_utc':datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),'runner_os':os.environ.get('RUNNER_OS',''),'runner_arch':os.environ.get('RUNNER_ARCH',''),'image_os':os.environ.get('ImageOS',''),'image_version':os.environ.get('ImageVersion',''),'image_label':os.environ.get('ImageLabel',''),'github_run_id':os.environ.get('GITHUB_RUN_ID',''),'github_run_attempt':os.environ.get('GITHUB_RUN_ATTEMPT',''),'options':{'run_benchmark':str(os.environ.get('RUN_BENCHMARK','false')).lower()=='true','include_large_file_listing':str(os.environ.get('INCLUDE_LARGE','false')).lower()=='true'}}; open(os.path.join(os.environ.get('REPORT_DIR','runner-report'),'report-metadata.json'),'w',encoding='utf-8').write(json.dumps(d,indent=2)+'\\n')"
+                    fi
+                  fi
+
+                  if [[ ! -f "$REPORT_DIR/benchmark.txt" ]]; then
+                    printf '%s\n' 'Benchmark not requested.' > "$REPORT_DIR/benchmark.txt"
+                  fi
+
+                  if [[ ! -f "$REPORT_DIR/large-files.txt" ]]; then
+                    printf '%s\n' 'Large-file analysis not requested.' > "$REPORT_DIR/large-files.txt"
+                  fi
+
+                  if [[ ! -f "$REPORT_DIR/large-directories.txt" ]]; then
+                    printf '%s\n' 'Large-file analysis not requested.' > "$REPORT_DIR/large-directories.txt"
+                  fi
+
+                  if [[ ! -f "$REPORT_DIR/docker-info.json" ]]; then
+                    printf '%s\n' '{"available": false}' > "$REPORT_DIR/docker-info.json"
+                  fi
+
+                  (
+                    cd "$REPORT_DIR"
+                    find . -maxdepth 1 -type f ! -name checksums.sha256 -print0 \
+                      | sort -z \
+                      | xargs -0 sha256sum > checksums.sha256
+                  )
+
+                  ARCHIVE_PATH="$GITHUB_WORKSPACE/$ARCHIVE_NAME"
+                  ARCHIVE_SUM_PATH="$GITHUB_WORKSPACE/$ARCHIVE_NAME.sha256"
+
+                  rm -f "$ARCHIVE_PATH" "$ARCHIVE_SUM_PATH"
+                  tar -czf "$ARCHIVE_PATH" -C "$REPORT_DIR" .
+                  sha256sum "$ARCHIVE_PATH" > "$ARCHIVE_SUM_PATH"
+
+                  {
+                    echo "## Runner Inventory"
+                    sed -n '1,80p' "$REPORT_DIR/summary.md"
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Upload runner report
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ubuntu-runner-report-${{ github.run_id }}-${{ github.run_attempt }}
+                  path: |
+                      runner-report
+                      ubuntu-runner-report.tar.gz
+                      ubuntu-runner-report.tar.gz.sha256
+                  if-no-files-found: error
+                  retention-days: 14
