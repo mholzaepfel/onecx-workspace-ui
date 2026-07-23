@@ -1,0 +1,345 @@
+# OneCX Workspace UI — E2E Integration Tests
+#
+# Runs the full platform stack (via @onecx/integration-tests / Testcontainers)
+# and executes Playwright E2E tests against it.
+#
+# Triggers:
+#   - workflow_dispatch  : manual on-demand run (lenient — reports failure but job stays green)
+#   - schedule           : nightly at 00:00 UTC (strict — test failure fails the job)
+#
+# How Docker image caching works:
+#   On a cache miss, Testcontainers pulls all required images during the test run.
+#   Afterwards, newly pulled images are archived and stored via actions/cache.
+#   On the next run, the archive is restored before the tests start so Testcontainers
+#   can reuse already-present images without pulling them again.
+#
+#   Cache key components:
+#     runner.os         — image format is OS-specific
+#     v1                — bump manually to force full invalidation
+#     platform.json     — E2E image reference or any platform setting changed
+#     package-lock.json — @onecx/integration-tests version governs the default
+#                         platform image list; a library upgrade may require new
+#                         images even when platform.json itself is unchanged
+#
+#   No restore-keys: an exact hit or a fresh pull is safer than a partial match
+#   that could restore an archive built for a different library or platform version.
+#
+#   TODO (cache invalidation — follow-up required):
+#     The platform currently uses mutable Docker tags (main, latest, 2.x, main-e2e).
+#     An unchanged platform.json and package-lock.json can therefore produce a warm
+#     cache hit that restores an outdated image for a tag whose upstream content has
+#     changed. This is accepted for the initial test phase of this workflow.
+#     A digest-aware or registry-aware cache invalidation strategy must be designed
+#     and implemented as a separate follow-up task.
+#
+name: E2E Tests
+
+on:
+    workflow_dispatch:
+        inputs:
+            verbose:
+                description: "Enable verbose runner output"
+                type: boolean
+                default: false
+            capture_logs:
+                description: "Capture per-container logs to files"
+                type: boolean
+                default: true
+
+    # schedule:
+    #   # Nightly at midnight UTC
+    #   - cron: '0 0 * * *'
+
+env:
+    NODE_VERSION: "24"
+    ARTIFACTS_DIR: integration-tests/artifacts
+    # Path for the compressed Docker image archive used by the cache steps.
+    DOCKER_CACHE_ARCHIVE: /tmp/onecx-e2e-docker-images.tar.gz
+
+jobs:
+    e2e-tests:
+        name: E2E Tests (${{ github.event_name == 'schedule' && 'nightly' || 'on-demand' }})
+        runs-on: ubuntu-latest
+        timeout-minutes: 60
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Setup Node.js ${{ env.NODE_VERSION }}
+              uses: actions/setup-node@v4
+              with:
+                  node-version: ${{ env.NODE_VERSION }}
+                  cache: npm
+
+            # No GHCR login: all OneCX platform images and the E2E image declared
+            # in integration-tests/platform/platform.json are public. Testcontainers
+            # pulls them anonymously. Add docker/login-action here (with an explanation)
+            # only if private images are introduced.
+
+            - name: Restore Docker image cache
+              id: cache-docker
+              uses: actions/cache/restore@v4
+              with:
+                  path: ${{ env.DOCKER_CACHE_ARCHIVE }}
+                  # See the TODO at the top of this file regarding mutable-tag invalidation.
+                  key: docker-images-${{ runner.os }}-v1-${{ hashFiles('integration-tests/platform/platform.json', 'package-lock.json') }}
+
+            - name: Load Docker images from cache
+              if: steps.cache-docker.outputs.cache-hit == 'true'
+              run: |
+                  set -euo pipefail
+                  if [[ ! -f "${DOCKER_CACHE_ARCHIVE}" || ! -s "${DOCKER_CACHE_ARCHIVE}" ]]; then
+                    echo "::error::Cache hit reported but archive is missing or empty at ${DOCKER_CACHE_ARCHIVE}."
+                    exit 1
+                  fi
+                  echo "Cache hit — loading images from ${DOCKER_CACHE_ARCHIVE}"
+                  docker load < "${DOCKER_CACHE_ARCHIVE}"
+                  echo "Restored Docker images:"
+                  docker images --format "table {{.Repository}}:{{.Tag}}\t{{.Size}}"
+
+            # Snapshot the image IDs currently in the Docker daemon before the tests
+            # run. Used afterwards to identify exactly which images Testcontainers
+            # pulled during the E2E execution (before/after diff).
+            - name: Record pre-test Docker image state
+              id: pre-test-images
+              if: steps.cache-docker.outputs.cache-hit != 'true'
+              run: |
+                  set -euo pipefail
+                  docker images --no-trunc --format '{{.ID}}' | sort -u \
+                    > /tmp/docker-images-before.txt
+                  echo "Pre-test image count: $(wc -l < /tmp/docker-images-before.txt | tr -d ' ')"
+
+            - name: Install dependencies
+              # --legacy-peer-deps is required by the current dependency graph.
+              run: npm ci --legacy-peer-deps
+
+            - name: Run E2E tests
+              id: run-e2e
+              continue-on-error: true
+              run: npm run e2e
+              env:
+                  IT_VERBOSE: ${{ github.event.inputs.verbose || 'false' }}
+                  IT_CAPTURE_LOGS: ${{ github.event.inputs.capture_logs || 'true' }}
+
+            # Collect the E2E result and write the GitHub Step Summary.
+            # This step does NOT enforce the failure policy (no exit 1) so that
+            # artifact upload and Docker caching always run first.
+            # Sets outputs consumed by the final "Enforce failure policy" step:
+            #   summary_found — 'true' if summary.json was produced by the test run
+            #   status        — 'success', 'failure', or 'unknown'
+            - name: Collect and report test results
+              id: report
+              if: always()
+              continue-on-error: true
+              run: |
+                  set -euo pipefail
+                  SUMMARY_FILE=$(find "${{ env.ARTIFACTS_DIR }}" -name "summary.json" 2>/dev/null | head -1)
+
+                  echo "## E2E Test Results" >> "$GITHUB_STEP_SUMMARY"
+                  echo "" >> "$GITHUB_STEP_SUMMARY"
+
+                  if [[ -z "${SUMMARY_FILE}" ]]; then
+                    echo "⚠️ **No summary.json found** — the runner may have crashed before producing output." \
+                      >> "$GITHUB_STEP_SUMMARY"
+                    echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+                    echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+                    echo "| Status | unknown |" >> "$GITHUB_STEP_SUMMARY"
+                    echo "| Trigger | ${{ github.event_name }} |" >> "$GITHUB_STEP_SUMMARY"
+                    echo "| Step outcome | ${{ steps.run-e2e.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+                    echo "summary_found=false" >> "$GITHUB_OUTPUT"
+                    echo "status=unknown" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
+
+                  STATUS=$(jq -r '.status // "unknown"' "${SUMMARY_FILE}")
+                  DURATION_MS=$(jq -r '.durationMs // 0' "${SUMMARY_FILE}")
+                  EXIT_CODE=$(jq -r '.exitCode // 1' "${SUMMARY_FILE}")
+                  MODE=$(jq -r '.mode // "unknown"' "${SUMMARY_FILE}")
+                  DURATION_S=$(( DURATION_MS / 1000 ))
+
+                  if [[ "${STATUS}" == "success" ]]; then
+                    STATUS_ICON="✅"
+                  else
+                    STATUS_ICON="❌"
+                  fi
+
+                  echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+                  echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+                  echo "| Result | ${STATUS_ICON} **${STATUS}** |" >> "$GITHUB_STEP_SUMMARY"
+                  echo "| Duration | ${DURATION_S}s |" >> "$GITHUB_STEP_SUMMARY"
+                  echo "| Exit code | ${EXIT_CODE} |" >> "$GITHUB_STEP_SUMMARY"
+                  echo "| Mode | ${MODE} |" >> "$GITHUB_STEP_SUMMARY"
+                  echo "| Trigger | ${{ github.event_name }} |" >> "$GITHUB_STEP_SUMMARY"
+                  echo "| Run ID | ${{ github.run_id }} |" >> "$GITHUB_STEP_SUMMARY"
+                  echo "| Step outcome | ${{ steps.run-e2e.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+                  echo "" >> "$GITHUB_STEP_SUMMARY"
+                  echo "Test artifacts are available in the **Artifacts** section below." \
+                    >> "$GITHUB_STEP_SUMMARY"
+
+                  echo "summary_found=true" >> "$GITHUB_OUTPUT"
+                  echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+
+            - name: Upload test artifacts
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: e2e-artifacts-${{ github.run_id }}
+                  path: ${{ env.ARTIFACTS_DIR }}/
+                  retention-days: 14
+                  if-no-files-found: warn
+
+            # Collect and archive the Docker images that were newly pulled during the
+            # E2E run, plus the E2E image declared in platform.json.
+            #
+            # Image selection strategy — before/after image ID diff:
+            #   Before the tests, image IDs were recorded in /tmp/docker-images-before.txt.
+            #   After the tests, new IDs = current − before; these are exactly the images
+            #   Testcontainers pulled during the run. We resolve repository:tag references
+            #   for those IDs and additionally include the E2E image from platform.json.
+            #
+            #   This approach avoids hard-coding external image versions (Postgres, Keycloak,
+            #   Node, …) and captures whatever the integration-test library actually pulled,
+            #   regardless of future base-image changes.
+            #
+            #   Each selected reference is validated with docker image inspect before being
+            #   passed to docker save to guard against stale or partially resolved names.
+            #
+            # Runs with always() so the cache is populated even when tests fail,
+            # preventing a repeated cold pull on the next run.
+            - name: Collect and archive Docker images
+              id: archive-images
+              if: always() && steps.cache-docker.outputs.cache-hit != 'true'
+              run: |
+                  set -euo pipefail
+
+                  # Read the configured E2E image from platform.json.
+                  E2E_IMAGE=$(jq -r '.platformConfig.container.e2e.image // empty' \
+                    integration-tests/platform/platform.json)
+                  echo "E2E image from platform.json: ${E2E_IMAGE:-<none>}"
+
+                  # --- Before/after image ID diff ---
+                  BEFORE_FILE=/tmp/docker-images-before.txt
+                  mapfile -t BEFORE_IDS < <(sort -u "${BEFORE_FILE}" 2>/dev/null || true)
+
+                  mapfile -t CURRENT_IDS < <(
+                    docker images --no-trunc --format '{{.ID}}' | sort -u
+                  )
+
+                  mapfile -t NEW_IDS < <(
+                    comm -13 \
+                      <(printf '%s\n' "${BEFORE_IDS[@]+"${BEFORE_IDS[@]}"}" | sort -u) \
+                      <(printf '%s\n' "${CURRENT_IDS[@]+"${CURRENT_IDS[@]}"}" | sort -u)
+                  )
+
+                  echo "Image IDs newly pulled during test run: ${#NEW_IDS[@]}"
+
+                  SELECTED=()
+
+                  if [[ ${#NEW_IDS[@]} -gt 0 ]]; then
+                    # Build a lookup set of newly pulled IDs for O(1) membership test.
+                    declare -A NEW_ID_SET
+                    for nid in "${NEW_IDS[@]}"; do
+                      NEW_ID_SET["${nid}"]=1
+                    done
+
+                    # Collect repo:tag references for IDs in the new set; skip dangling images.
+                    while IFS=' ' read -r repo tag id; do
+                      [[ "${repo}" == "<none>" || "${tag}" == "<none>" ]] && continue
+                      [[ -n "${NEW_ID_SET[${id}]+x}" ]] && SELECTED+=("${repo}:${tag}")
+                    done < <(
+                      docker images --no-trunc --format '{{.Repository}} {{.Tag}} {{.ID}}'
+                    )
+                  fi
+
+                  # Always include the E2E image from platform.json if it is present
+                  # locally (it may have been pulled before the snapshot, e.g. via a
+                  # previous step, but it is still required for the cached run).
+                  if [[ -n "${E2E_IMAGE}" ]]; then
+                    if docker image inspect "${E2E_IMAGE}" > /dev/null 2>&1; then
+                      SELECTED+=("${E2E_IMAGE}")
+                    else
+                      echo "Warning: E2E image '${E2E_IMAGE}' not found locally — skipping."
+                    fi
+                  fi
+
+                  # Deduplicate.
+                  if [[ ${#SELECTED[@]} -gt 0 ]]; then
+                    mapfile -t SELECTED < <(printf '%s\n' "${SELECTED[@]}" | sort -u)
+                  fi
+
+                  # Validate every selected reference individually before passing to docker save.
+                  VALID=()
+                  for img in "${SELECTED[@]+"${SELECTED[@]}"}"; do
+                    if docker image inspect "${img}" > /dev/null 2>&1; then
+                      VALID+=("${img}")
+                    else
+                      echo "Warning: '${img}' failed docker image inspect — excluding from archive."
+                    fi
+                  done
+
+                  if [[ ${#VALID[@]} -eq 0 ]]; then
+                    echo "::warning::No valid Docker images found to archive. Skipping Docker cache creation."
+                    echo "archive_created=false" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
+
+                  echo "Archiving ${#VALID[@]} image reference(s):"
+                  printf '  %s\n' "${VALID[@]}"
+
+                  if ! docker save "${VALID[@]}" | gzip > "${DOCKER_CACHE_ARCHIVE}"; then
+                    echo "::error::Failed to create the compressed Docker image archive."
+                    rm -f "${DOCKER_CACHE_ARCHIVE}"
+                    echo "archive_created=false" >> "$GITHUB_OUTPUT"
+                    exit 1
+                  fi
+
+                  if [[ ! -s "${DOCKER_CACHE_ARCHIVE}" ]]; then
+                    echo "::error::Docker image archive is missing or empty."
+                    rm -f "${DOCKER_CACHE_ARCHIVE}"
+                    echo "archive_created=false" >> "$GITHUB_OUTPUT"
+                    exit 1
+                  fi
+
+                  ARCHIVE_SIZE=$(du -sh "${DOCKER_CACHE_ARCHIVE}" | cut -f1)
+                  echo "Archive: ${DOCKER_CACHE_ARCHIVE} (${ARCHIVE_SIZE})"
+                  echo "Archived ${#VALID[@]} image reference(s)."
+                  echo "archive_created=true" >> "$GITHUB_OUTPUT"
+
+            # Store the archive only when it was successfully created.
+            # GitHub Actions cache entries are immutable; saving with a key that already
+            # exists (e.g. from a concurrent run) is silently skipped.
+            - name: Store image archive in Actions cache
+              if: always() && steps.archive-images.outputs.archive_created == 'true'
+              uses: actions/cache/save@v4
+              with:
+                  path: ${{ env.DOCKER_CACHE_ARCHIVE }}
+                  key: docker-images-${{ runner.os }}-v1-${{ hashFiles('integration-tests/platform/platform.json', 'package-lock.json') }}
+
+            # Enforce the trigger-dependent failure policy as the very last step so
+            # that artifact upload and Docker caching always complete first.
+            #   - schedule          : missing summary.json or failed tests → exit 1
+            #   - workflow_dispatch : failed tests → warning only, job stays green
+            - name: Enforce failure policy
+              if: always()
+              run: |
+                  set -euo pipefail
+                  SUMMARY_FOUND="${{ steps.report.outputs.summary_found }}"
+                  STATUS="${{ steps.report.outputs.status }}"
+                  TEST_OUTCOME="${{ steps.run-e2e.outcome }}"
+                  EVENT="${{ github.event_name }}"
+
+                  if [[ "${EVENT}" == "schedule" ]] &&
+                     { [[ "${SUMMARY_FOUND}" != "true" ]] ||
+                       [[ "${STATUS}" != "success" ]] ||
+                       [[ "${TEST_OUTCOME}" != "success" ]]; }; then
+                    echo "::error::E2E scheduled run failed (summaryFound=${SUMMARY_FOUND}, status=${STATUS}, outcome=${TEST_OUTCOME})."
+                    exit 1
+                  fi
+
+                  if [[ "${EVENT}" == "workflow_dispatch" ]] &&
+                     { [[ "${SUMMARY_FOUND}" != "true" ]] ||
+                       [[ "${STATUS}" != "success" ]] ||
+                       [[ "${TEST_OUTCOME}" != "success" ]]; }; then
+                    echo "::warning::E2E on-demand run was unsuccessful (summaryFound=${SUMMARY_FOUND}, status=${STATUS}, outcome=${TEST_OUTCOME}). Job kept green per policy."
+                  fi

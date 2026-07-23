@@ -16,7 +16,7 @@ const translations: Record<Locale, WorkspaceI18n> = {
     create_button_label: 'Erstellen',
     import_button_label: 'Import',
     create_button_aria: 'Einen neuen Workspace erstellen',
-    breadcrumb_workspace: 'onecx-workspace',
+    breadcrumb_workspace: 'onecx-workspace'
   },
   en: {
     page_title: 'Workspace Management',
@@ -24,8 +24,8 @@ const translations: Record<Locale, WorkspaceI18n> = {
     create_button_label: 'Create',
     import_button_label: 'Import',
     create_button_aria: 'Create a new workspace',
-    breadcrumb_workspace: 'onecx-workspace',
-  },
+    breadcrumb_workspace: 'onecx-workspace'
+  }
 }
 
 function resolveLocale(): Locale {

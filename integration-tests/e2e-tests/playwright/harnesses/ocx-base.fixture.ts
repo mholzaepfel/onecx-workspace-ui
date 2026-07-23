@@ -53,8 +53,8 @@ export const test = base.extend<{ _autoLogs: void }>({
 
       await use()
     },
-    { auto: true },
-  ],
+    { auto: true }
+  ]
 })
 
 export { expect } from '@playwright/test'
